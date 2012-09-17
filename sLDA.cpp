@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <boost/math/special_functions/digamma.hpp>
+#include <google/sparse_hash_map>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +8,10 @@
 
 #define RUNIF() drand48()
 #define RUNIF_SEED(s) srand48(s)
+
+using boost::math::digamma;
+using google::sparse_hash_map;
+using std::string;
 
 class Matrix {
 public:
@@ -48,6 +54,75 @@ private:
 };
 
 template <typename T>
+class SparseMatrix {
+public:
+  typedef sparse_hash_map<
+      unsigned int, T
+  > innerDataType;
+
+  typedef sparse_hash_map<
+      unsigned int, innerDataType
+  > dataType;
+
+  explicit SparseMatrix(T fallback) : fallback_(fallback) {
+  }
+
+  const T get(unsigned int index, unsigned int topic) const {
+    typename dataType::const_iterator iter = data_.find(index);
+
+    if (iter == data_.end()) {
+      return fallback_;
+    }
+
+    typename innerDataType::const_iterator iter2 =
+      iter->second.find(topic);
+
+    if (iter2 == iter->second.end()) {
+      return fallback_;
+    }
+    return iter2->second;
+  }
+
+  void clear() {
+    data_.clear();
+  }
+
+  void set(unsigned int index, unsigned int topic, const T& val) {
+    data_[index][topic] = val;
+  }
+
+  void increment(unsigned int index, unsigned int topic) {
+    data_[index][topic]++;
+  }
+
+  void decrement(unsigned int index, unsigned int topic) {
+    data_[index][topic]--;
+  }
+
+  const dataType& getData() const {
+    return data_;
+  }
+
+  template <typename U>
+  void add(const SparseMatrix<U>& other, double a, double b) {
+    for (typename SparseMatrix<U>::dataType::const_iterator iter = other.getData().begin();
+         iter != other.getData().end();
+         ++iter) {
+      for (typename SparseMatrix<U>::innerDataType::const_iterator iter2 = iter->second.begin();
+           iter2 != iter->second.end();
+           ++iter2) {
+        data_[iter->first][iter2->first] =
+          a * data_[iter->first][iter2->first] + b * iter2->second;
+      }
+    }
+  }
+
+protected:
+  T fallback_;
+  dataType data_;
+};
+
+template <typename T>
 class Vector {
 public:
   explicit Vector(unsigned int size) :
@@ -60,7 +135,11 @@ public:
     delete data_;
   }
 
-  T get(unsigned int index) const {
+  const T& get(unsigned int index) const {
+    return data_[index];
+  }
+
+  T& get(unsigned int index) {
     return data_[index];
   }
 
@@ -99,6 +178,16 @@ class RaggedArray : public Vector<Vector<int>*> {
 public:
   explicit RaggedArray(unsigned int size) :
     Vector<Vector<int>*>(size) {
+    for (unsigned int ii = 0; ii < size; ++ii) {
+      Vector<Vector<int>*>::get(ii) = new Vector<int>(0);
+    }
+  }
+
+  ~RaggedArray() {
+    for (unsigned int ii = 0; ii < size(); ++ii) {
+      delete Vector<Vector<int>*>::get(ii);
+    }
+    // Delete data as well?
   }
 
   Vector<int>& get(unsigned int index) const {
@@ -140,11 +229,12 @@ public:
     num_topics_(num_topics),
     V_(V),
     sigma2_(sigma2),
-    topics_(V, num_topics),
+    topics_(topic_smoothing),
+    lambda_(FIXME),
     probs_(num_topics),
     batch_size_(batch_size),
     document_sums_(batch_size, num_topics),
-    topic_sums_(num_topics),
+    topic_counts_(0),
     document_smoothing_(document_smoothing),
     topic_smoothing_(topic_smoothing),
     coefs_(num_topics),
@@ -152,11 +242,8 @@ public:
   }
 
   // TODO: Initialization (do it in R?)
-  // TODO: Should we assume topics_ are fixed?
-  // TODO: Whence corpus?
-  // TODO: Save which documents were in mini-batch (needed for assignment deserialization).
 
-  void serialize(const std::string& prefix) {
+  void serialize(const string& prefix) {
     FILE* f;
     f = fopen((prefix + ".topics").c_str(), "wb");
     topics_.serialize(f);
@@ -164,10 +251,6 @@ public:
 
     f = fopen((prefix + ".document_sums").c_str(), "wb");
     document_sums_.serialize(f);
-    fclose(f);
-
-    f = fopen((prefix + ".topic_sums").c_str(), "wb");
-    topic_sums_.serialize(f);
     fclose(f);
 
     f = fopen((prefix + ".coefs").c_str(), "wb");
@@ -179,7 +262,7 @@ public:
     fclose(f);
   }
 
-  void deserialize(const std::string& prefix) {
+  void deserialize(const string& prefix) {
     FILE* f;
     f = fopen((prefix + ".topics").c_str(), "rb");
     topics_.deserialize(f);
@@ -187,10 +270,6 @@ public:
 
     f = fopen((prefix + ".document_sums").c_str(), "rb");
     document_sums_.deserialize(f);
-    fclose(f);
-
-    f = fopen((prefix + ".topic_sums").c_str(), "rb");
-    topic_sums_.deserialize(f);
     fclose(f);
 
     f = fopen((prefix + ".coefs").c_str(), "rb");
@@ -216,6 +295,7 @@ public:
       int old_k = assignments_.get(batch_index, ii);
       document_sums_.decrement(batch_index, old_k);
       y_hat -= coefs_.get(old_k) / doc.size();
+      topic_counts_.decrement(word, old_k);
 
       // Compute un-normalized topic probabilities.
       double p_sum = 0.0;
@@ -227,8 +307,7 @@ public:
           kk,
           slda_part *
           (document_sums_.get(batch_index, kk) + document_smoothing_) *
-          (topics_.get(word, kk) + topic_smoothing_) /
-          topic_sums_.get(V_ * topic_smoothing_)
+          topics_.get(word, kk)
         );
         p_sum += probs_.get(kk);
       }
@@ -248,20 +327,83 @@ public:
       assignments_.set(batch_index, ii, new_k);
       document_sums_.increment(batch_index, new_k);
       y_hat += coefs_.get(new_k) / doc.size();
+      topic_counts_.increment(word, old_k);
     }
+  }
+
+  void updateTopicsFromLambda() {
+    topics_.clear();
+    // TODO: this should compute the digamma quantity.
+  }
+
+  void updateLambda(double corpus_size, double learning_rate) {
+    double batch_ratio = corpus_size / batch_size_;
+
+    lambda_.add(topic_counts_,
+                (1 - learning_rate),
+                learning_rate * batch_ratio);
+
+    updateTopicsFromLambda();
   }
 
 private:
   unsigned int num_topics_;
   unsigned int V_;
   double sigma2_;
-  Matrix topics_;
+  SparseMatrix<double> topics_;
+  SparseMatrix<double> lambda_;
   Vector<double> probs_;
   unsigned int batch_size_;
   Matrix document_sums_;
-  Vector<int> topic_sums_;
+  SparseMatrix<int> topic_counts_;
   double document_smoothing_;
   double topic_smoothing_;
   Vector<double> coefs_;
   RaggedArray assignments_;
 };
+
+class Learner {
+public:
+  explicit Learner(Model& model,
+                   unsigned int batch_size,
+                   unsigned int corpus_size,
+                   double t0,
+                   double kappa) :
+    model_(model),
+    corpus_(batch_size),
+    corpus_size_(corpus_size),
+    t0_(t0),
+    kappa_(kappa) {
+  }
+
+  void processBatch(int iteration, FILE* f, int num_iterations) {
+    corpus_.deserialize(f);
+    // FIXME: Read annotations
+    double y = 0.0;
+    for (int ii = 0; ii < num_iterations; ++ii) {
+      for (int dd = 0; dd < corpus_.size(); ++dd) {
+        model_.inferDocumentOnce(corpus_.get(dd), dd, y);
+      }
+    }
+
+    double learning_rate = pow(iteration + t0_, kappa_);
+    model_.updateLambda(corpus_size_, learning_rate);
+  }
+
+  void processStream(FILE* f, int num_iterations) {
+    int iteration = 0;
+    while (!feof(f)) {
+      processBatch(iteration, f, num_iterations);
+      iteration++;
+    }
+  }
+
+private:
+  Model model_;
+  Corpus corpus_;
+  std::vector<double> annotations_;
+  unsigned int corpus_size_;
+  double t0_;
+  double kappa_;
+};
+
